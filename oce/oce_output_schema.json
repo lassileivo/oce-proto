@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "properties": {
+    "triggers_hit": {
+      "type": "array"
+    },
+    "applied_modules": {
+      "type": "array"
+    },
+    "sections_present": {
+      "type": "array"
+    },
+    "missing_sections": {
+      "type": "array"
+    },
+    "confidence": {
+      "type": "number"
+    },
+    "policy_decision": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "triggers_hit",
+    "applied_modules",
+    "sections_present",
+    "missing_sections",
+    "confidence"
+  ]
+}

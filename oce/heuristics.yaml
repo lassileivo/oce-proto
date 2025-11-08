@@ -1,0 +1,26 @@
+intents:
+  strategy:
+    # Salli suomi + englanti + taivutukset
+    keywords: ["strategy", "strategia\\w*", "päätös\\w*", "vaihtoehto\\w*", "kriteeri\\w*", "priorisoin\\w*", "prioritiza\\w*"]
+    modules: ["StrategyMCDA", "RiskExpectedLoss", "Structure"]
+
+  risk:
+    keywords: ["risk\\w*", "riski\\w*", "uhka\\w*", "todennäköisyys\\w*", "vaikutus\\w*"]
+    modules: ["RiskExpectedLoss", "Structure"]
+
+  writing:
+    keywords: ["rakenna\\w*", "otsik\\w*", "runko\\w*", "argument\\w*"]
+    modules: ["Structure"]
+
+policies:
+  max_modules: 3
+  # Varmistus: jos mikään ei täsmää, ajetaan nämä kolme (niin näet modulit varmasti)
+  default_modules: ["Structure", "StrategyMCDA", "RiskExpectedLoss"]
+
+meta:
+  min_sources_recency: 1
+  min_diverse_domains: 2
+
+thresholds:
+  guided_threshold: 0.6
+  pro_threshold: 0.75

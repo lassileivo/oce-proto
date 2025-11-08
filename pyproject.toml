@@ -1,0 +1,6 @@
+[project]
+name = "oce-proto"
+version = "0.1.0"
+description = "Operational Cognition Extension (OCE) – prototype skeleton"
+requires-python = ">=3.10"
+dependencies = []
