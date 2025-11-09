@@ -1,0 +1,61 @@
+openapi: 3.0.1
+info:
+  title: OCE API
+  version: "0.3"
+  description: Operational Cognition Extension service (Render deployment).
+servers:
+  - url: https://YOUR-RENDER-URL.onrender.com
+paths:
+  /health:
+    get:
+      summary: Health check endpoint
+      operationId: health
+      responses:
+        "200":
+          description: OK
+  /run_oce:
+    post:
+      summary: Execute OCE reasoning pipeline
+      operationId: runOce
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunRequest"
+      responses:
+        "200":
+          description: Successful OCE response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunResponse"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    RunRequest:
+      type: object
+      required: [user_text]
+      properties:
+        user_text:
+          type: string
+        session_ctx:
+          type: object
+          additionalProperties: true
+    RunResponse:
+      type: object
+      required: [text, json_summary, telemetry]
+      properties:
+        text:
+          type: string
+        json_summary:
+          type: object
+          additionalProperties: true
+        telemetry:
+          type: object
+          additionalProperties: true
