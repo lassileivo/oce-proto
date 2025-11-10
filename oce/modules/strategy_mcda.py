@@ -1,363 +1,253 @@
 # oce/modules/strategy_mcda.py
 from __future__ import annotations
-from typing import Dict, Any, List, Tuple
 import re
-import math
+from typing import Dict, Any, List, Tuple
 
-# ---- Konfiguraatio / aliaset ----
-CRITERIA_ALIASES = {
-    "Impact": ["impact", "benefit", "value", "utility", "gain", "score"],
-    "Cost":   ["cost", "price", "budget", "expense", "capex", "opex", "€", "eur", "euro"],
-    "Risk":   ["risk", "p", "prob", "probability", "uncertainty", "chance"],
-}
+"""
+StrategyMCDA
+- Lukee A/B/C-vaihtoehdot luonnollisesta kielestä (regex).
+- Tukee painoja session_ctx["mcda"]["weights"] tai oletuksia (Impact 0.5, Cost 0.3, Risk 0.2).
+- Normalisointi: min–max; hyödyt (+) ja kustannukset (–) käsitellään oikein.
+- Hyötyfunktio: U(j) = Σ_i w_i * s_ij.
+- Vakavuus-tsekki: +0.10 yhden painon korotus (clamp 0..1) ja katsotaan muuttuuko suositus.
+- Palauttaa markdownin + sections_present/missing.
+"""
 
-# mikä kriteeri on "benefit" (suurempi parempi) vs "cost" (pienempi parempi)
-CRITERIA_KIND = {
-    "Impact": "benefit",
-    "Cost":   "cost",
-    "Risk":   "cost",
-}
+BENEFIT_KEYS = {"impact", "benefit", "value", "score"}
+COST_KEYS    = {"cost", "risk", "time", "effort", "price", "budget"}
 
-DEFAULT_WEIGHTS = {"Impact": 0.5, "Cost": 0.3, "Risk": 0.2}
-DEFAULT_CRITERIA = ["Impact", "Cost", "Risk"]
-
-# ---- Parsaustyökalut ----
-
-NUM_RE = re.compile(
+# --- apu: parsitaan "A (impact 8, cost 7000, risk 0.25)" ja variaatiot
+ALT_PATTERNS = [
     r"""
-    (?P<sign>[-+])?
-    (?P<int>\d{1,3}(?:[.,]\d{3})*|\d+)
-    (?:[.,](?P<frac>\d+))?
-    (?P<unit>\s*[kKmM%]?)    # k=1e3, M=1e6, %= /100
+    (?P<label>[A-Z])              # A/B/C
+    \s*[:(]\s*
+    (?P<body>[^)|;]+)             # impact 8, cost 7000, risk 0.25
+    [);]?
     """,
-    re.VERBOSE,
+    r"""
+    (?<!\w)option\s*(?P<label>[A-Z])\s*[:\-]\s*(?P<body>[^;]+)
+    """,
+]
+
+KV_PAT = re.compile(
+    r"""
+    (?P<key>[a-zA-Z_]+)\s*[:=]\s*
+    (?P<val>-?\d+(?:\.\d+)?)
+    """,
+    re.VERBOSE | re.IGNORECASE,
 )
 
-LABEL_RE = r"[A-Za-z][\w\-]*"
-
-# A) "A (impact 8, cost 7k, risk 25%)" -tyyppinen
-PAREN_OPT_RE = re.compile(
-    rf"\b(?P<label>{LABEL_RE})\s*\((?P<fields>[^)]+)\)"
-)
-
-# B) "A: impact 8 cost 7000 risk .25" tai "A impact=8 cost=7000 ..."
-INLINE_OPT_RE = re.compile(
-    rf"\b(?P<label>{LABEL_RE})\s*[:\-]?\s+(?P<fields>[^.;,\n]+)"
-)
-
-WEIGHTS_RE = re.compile(
-    r"\bweights?\b\s*[:(]?(?P<fields>[^)\n]+)\)?",
-    re.IGNORECASE,
-)
-
-def _norm_key(k: str) -> str:
-    return k.strip().lower()
-
-def _alias_to_canonical(name: str) -> str | None:
-    n = _norm_key(name)
-    for canon, aliases in CRITERIA_ALIASES.items():
-        if n == _norm_key(canon) or n in (_norm_key(a) for a in aliases):
-            return canon
-    return None
-
-def _parse_number(raw: str) -> float | None:
-    m = NUM_RE.search(raw.strip())
-    if not m:
-        return None
-    sgn = -1.0 if m.group("sign") == "-" else 1.0
-    int_part = m.group("int").replace(",", "").replace(".", "")
-    frac = m.group("frac")
-    if frac:
-        # alkuperäisessä "int" me poistimme erotinmerkit; rakennetaan decimal itse
-        num = float(int_part) / (10 ** len(frac)) + float("0." + frac)
-        # Yllä oleva tuottaa hieman virhettä jos int_part olikin '1234' ja frac '56'.
-        # Helpompi: korvataan tuhaterottimet pisteillä, pilkku desimaaliksi jos tarvitsee.
-        # Mutta käytännössä: tehdään luotettava re-rakennus:
-        pass
-    # Järjestä simppelisti: ota vain numeromerkkejä, yksi piste desimaaliksi
-    raw_digits = (m.group("int") or "")
-    raw_frac = m.group("frac") or ""
-    base = raw_digits.replace(",", "").replace(" ", "").replace("\u202f", "")
-    base = base.replace(".", "")  # poista mahdolliset tuhannerottimet
-    if raw_frac:
-        base = base + "." + raw_frac
-    try:
-        val = float(base)
-    except Exception:
-        return None
-
-    unit = (m.group("unit") or "").strip()
-    if unit.lower() == "k":
-        val *= 1_000.0
-    elif unit.lower() == "m":
-        val *= 1_000_000.0
-    elif unit == "%":
-        val /= 100.0
-
-    return sgn * val
-
-def _split_fields(s: str) -> List[str]:
-    # kentät eroteltu pilkulla tai välilyönnein; sallitaan "impact=8 cost=7000"
-    # hajotetaan ensin pilkulla, sen jälkeen jos ei löydy "=", yritetään parittain (key value)
-    parts = [x.strip() for x in re.split(r"[;,]", s) if x.strip()]
-    if len(parts) == 1 and "=" not in parts[0]:
-        # yritä rikkoa tilavälillä; esim "impact 8 cost 7000 risk .25"
-        tmp = parts[0].strip()
-        return [x.strip() for x in re.split(r"\s{2,}|\s(?=[A-Za-z])", tmp) if x.strip()]
-    return parts
-
-def _parse_keyvals(field_str: str) -> Dict[str, float]:
-    """
-    Palauttaa {CanonicalCriterion: value} jos osuu.
-    Hyväksyy muodot:
-      - "impact=8"
-      - "impact 8"
-      - "benefit: 7"
-      - "risk=25%"
-      - "price=5,500€"
-    """
-    out: Dict[str, float] = {}
-    fields = _split_fields(field_str)
-
-    # tee myös "key val key val" -paritus jos monisanaisia
-    tokens = []
-    for f in fields:
-        # jos "key=val" tai "key:val"
-        if "=" in f or ":" in f:
-            tokens.append(f)
-        else:
-            # jätä sellaisenaan, parsitaan myöhemmin parituksena
-            tokens.append(f)
-
-    # 1) Käsittele selkeät "key=val"/"key:val"
-    for t in list(tokens):
-        if "=" in t:
-            k, v = t.split("=", 1)
-        elif ":" in t:
-            k, v = t.split(":", 1)
-        else:
-            continue
-        canon = _alias_to_canonical(k)
-        if canon is None:
-            continue
-        num = _parse_number(v)
-        if num is not None:
-            out[canon] = num
-
-    # 2) Käsittele "key value" muodot
-    #    Etsi "word number" -pareja
-    kv_pairs = re.findall(r"([A-Za-z€]+)\s+([+−\-]?\d[\d.,]*(?:\s*[kKmM%])?)", field_str)
-    for k, v in kv_pairs:
-        canon = _alias_to_canonical(k)
-        if canon is None:
-            continue
-        num = _parse_number(v)
-        if num is not None and canon not in out:
-            out[canon] = num
-
-    return out
-
-def _parse_options(text: str) -> Dict[str, Dict[str, float]]:
-    """
-    Yrittää ensin ( ... ) -rakenteet, sitten inline-linjat.
-    Palauttaa: {"A":{"Impact":..,"Cost":..,"Risk":..}, ...}
-    """
+def _parse_options(user_text: str) -> Dict[str, Dict[str, float]]:
+    text = user_text.strip()
     options: Dict[str, Dict[str, float]] = {}
-
-    # (1) parenteesi-optio
-    for m in PAREN_OPT_RE.finditer(text):
-        label = m.group("label")
-        fields = m.group("fields")
-        kv = _parse_keyvals(fields)
-        if kv:
-            options[label] = kv
-
-    # (2) inline-optio, jos ei löytynyt tarpeeksi
-    #     suodatetaan painot pois, ettei se sekoitu A/B-optioihin
-    text_wo_weights = WEIGHTS_RE.sub("", text)
-    for m in INLINE_OPT_RE.finditer(text_wo_weights):
-        label = m.group("label")
-        fields = m.group("fields")
-        # jos tämä on ilmeinen vertailun intro (e.g. "Compare A vs B"), ohita
-        if _norm_key(label) in {"compare", "vs", "versus"}:
-            continue
-        kv = _parse_keyvals(fields)
-        # vaadi vähintään yhtä tunnistettua kriteeriä, ettei se nappaa satunnaisia lauseita
-        if kv:
-            # älä ylikirjoita jo löydettyä (parens on etusijalla)
-            options.setdefault(label, kv)
-
+    for pat in ALT_PATTERNS:
+        for m in re.finditer(pat, text, re.VERBOSE | re.IGNORECASE):
+            label = m.group("label").upper()
+            body = m.group("body")
+            kvs = {}
+            for km in KV_PAT.finditer(body):
+                k = km.group("key").lower().strip()
+                v = float(km.group("val"))
+                kvs[k] = v
+            if kvs:
+                options[label] = kvs
+    # fallback: "Compare A vs B" → generoi mallit
+    if not options and re.search(r"\bcompare\s+([A-Z])\s+vs\s+([A-Z])\b", text, re.I):
+        options = {
+            "A": {"impact": 8, "cost": 7000, "risk": 0.25},
+            "B": {"impact": 7, "cost": 5500, "risk": 0.30},
+            "C": {"impact": 6, "cost": 4800, "risk": 0.40},
+        }
     return options
 
-def _parse_weights(text: str, crits: List[str]) -> Dict[str, float] | None:
-    m = WEIGHTS_RE.search(text)
-    if not m:
-        return None
-    kv = _parse_keyvals(m.group("fields"))
-    # palauta vain tunnetut kriteerit
-    w = {c: kv[c] for c in crits if c in kv}
-    return w or None
+def _decide_attribute_polarity(keys: List[str]) -> Dict[str, str]:
+    pol: Dict[str, str] = {}
+    for k in keys:
+        lk = k.lower()
+        if lk in BENEFIT_KEYS:
+            pol[k] = "benefit"
+        elif lk in COST_KEYS:
+            pol[k] = "cost"
+        else:
+            # Heuristiikka: jos nimi näyttää risk/price tyyppiseltä → cost, muuten benefit
+            if any(x in lk for x in ("risk", "cost", "price", "loss")):
+                pol[k] = "cost"
+            else:
+                pol[k] = "benefit"
+    return pol
 
-def _minmax(x: float, lo: float, hi: float, reverse=False) -> float:
-    if hi == lo:
-        return 0.0
-    v = (x - lo) / (hi - lo)
-    return 1.0 - v if reverse else v
+def _min_max(values: List[float]) -> Tuple[float, float]:
+    lo = min(values)
+    hi = max(values)
+    return lo, hi
 
-# ---- Pääajologiikka ----
+def _normalize_matrix(options: Dict[str, Dict[str, float]], polarity: Dict[str, str]) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Tuple[float, float]]]:
+    # tee avainlista vakaassa järjestyksessä
+    all_keys = sorted({k for d in options.values() for k in d.keys()})
+    # domainit
+    domains: Dict[str, Tuple[float, float]] = {}
+    for k in all_keys:
+        vs = [options[o].get(k) for o in options if k in options[o]]
+        if not vs:
+            continue
+        lo, hi = _min_max(vs)
+        domains[k] = (lo, hi)
+    # normalisointi
+    S: Dict[str, Dict[str, float]] = {o: {} for o in options}
+    for k in all_keys:
+        if k not in domains:
+            continue
+        lo, hi = domains[k]
+        rng = max(hi - lo, 1e-12)
+        for o in options:
+            if k not in options[o]:
+                continue
+            raw = options[o][k]
+            # benefit: isompi parempi, cost: pienempi parempi
+            if polarity.get(k, "benefit") == "benefit":
+                s = (raw - lo) / rng
+            else:
+                s = (hi - raw) / rng
+            S[o][k] = max(0.0, min(1.0, s))
+    return S, domains
+
+def _weights_from_ctx(session_ctx: Dict[str, Any], keys: List[str]) -> Dict[str, float]:
+    # oletukset
+    default = {"impact": 0.5, "cost": 0.3, "risk": 0.2}
+    w: Dict[str, float] = {}
+    # ctx override
+    ctxw = ((session_ctx or {}).get("mcda") or {}).get("weights") if session_ctx else None
+    for k in keys:
+        lk = k.lower()
+        if isinstance(ctxw, dict) and lk in ctxw:
+            w[k] = float(ctxw[lk])
+        else:
+            # perusheuristiikka
+            if lk in default:
+                w[k] = default[lk]
+            else:
+                # tasajako uusille
+                w[k] = 0.0
+    # jos tasajako-osuus jäi 0, jaa muiden ulkopuolinen massa tasan
+    s = sum(w.values())
+    if s <= 0.0:
+        # täysin tuntemattomat → tasapainotus kaikkiin
+        n = len(keys) if keys else 1
+        w = {k: 1.0 / n for k in keys}
+        return w
+    if s < 1.0 and keys:
+        missing = 1.0 - s
+        # Jaa missing tasan niille, joilla paino 0
+        zeros = [k for k in keys if w.get(k, 0.0) == 0.0]
+        if zeros:
+            extra = missing / len(zeros)
+            for k in zeros:
+                w[k] += extra
+        else:
+            # skaalataan suhteessa
+            factor = 1.0 / s
+            for k in keys:
+                w[k] *= factor
+    elif s > 1.0:
+        factor = 1.0 / s
+        for k in keys:
+            w[k] *= factor
+    return w
+
+def _utility(S: Dict[str, Dict[str, float]], weights: Dict[str, float]) -> Dict[str, float]:
+    U: Dict[str, float] = {}
+    for o, row in S.items():
+        u = 0.0
+        for k, s in row.items():
+            u += weights.get(k, 0.0) * s
+        U[o] = u
+    return U
+
+def _stability_check(U: Dict[str, float], weights: Dict[str, float], S: Dict[str, Dict[str, float]]) -> Tuple[bool, str]:
+    # korota kutakin painoa +0.10 (clamp 0..1) yksitellen ja katso muuttuuko paras
+    import math
+    if not U:
+        return False, "No options."
+    base_best = max(U, key=U.get)
+    keys = list(weights.keys())
+    changed = False
+    notes = []
+    for k in keys:
+        w2 = weights.copy()
+        w2[k] = min(1.0, w2.get(k, 0.0) + 0.10)
+        # renormalisoi
+        s = sum(w2.values())
+        if s <= 0:
+            continue
+        for kk in w2:
+            w2[kk] /= s
+        U2 = _utility(S, w2)
+        best2 = max(U2, key=U2.get)
+        if best2 != base_best:
+            changed = True
+            notes.append(f"Switch if {k}+0.10 → {best2}")
+    return (not changed), ("; ".join(notes) if notes else "Stable to +0.10 single-weight tweaks.")
 
 def run(user_text: str, context: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    StrategyMCDA v3 – luonnollisen kielen A/B/C-lukija (regex):
-      - Parsii vaihtoehdot ja painot tekstistä
-      - Yhtenäistää kriteerit aliaksilla
-      - Laskee min–max-normalisoinnin (benefit vs cost)
-      - Tekee herkkyysanalyysin (+0.10 yksittäiseen painoon)
-    """
-    text = user_text.strip()
-
-    # 1) Parse options
-    options = _parse_options(text)
-    diag: List[str] = []
+    session_ctx = (context or {}).get("session_ctx") or {}
+    # 1) Parsitaan vaihtoehdot
+    options = _parse_options(user_text)
     if not options:
-        # fallback: käytä demodataa
-        options = {
-            "A": {"Impact": 8, "Cost": 7000, "Risk": 0.25},
-            "B": {"Impact": 7, "Cost": 5500, "Risk": 0.30},
-            "C": {"Impact": 6, "Cost": 4800, "Risk": 0.40},
-        }
-        diag.append("No structured options found in text → using demo A/B/C.")
+        # fallback: jos kontekstissa olisi options
+        ctx_opts = ((context or {}).get("mcda") or {}).get("options") if context else None
+        if isinstance(ctx_opts, dict) and ctx_opts:
+            options = ctx_opts
+        else:
+            options = {
+                "A": {"impact": 8, "cost": 7000, "risk": 0.25},
+                "B": {"impact": 7, "cost": 5500, "risk": 0.30},
+                "C": {"impact": 6, "cost": 4800, "risk": 0.40},
+            }
+    # 2) Määritä attribuuttien polariteetti
+    all_keys = sorted({k for d in options.values() for k in d.keys()})
+    polarity = _decide_attribute_polarity(all_keys)
+    # 3) Normalisointi
+    S, domains = _normalize_matrix(options, polarity)
+    # 4) Painot
+    weights = _weights_from_ctx(session_ctx, all_keys)
+    # 5) Hyöty
+    U = _utility(S, weights)
+    # 6) Suositus
+    rec = max(U, key=U.get) if U else None
+    # 7) Vakavuus
+    stable, note = _stability_check(U, weights, S)
 
-    # 2) Kokoa käytetyt kriteerit (union kaikista optioneista, mutta järjestä oletuslista etusijalle)
-    crits_found = set()
-    for o in options.values():
-        for k in o.keys():
-            if k in CRITERIA_KIND:
-                crits_found.add(k)
+    # Markdown
+    md_lines: List[str] = []
+    md_lines.append("# StrategyMCDA")
+    md_lines.append("**Criteria:**")
+    for k in all_keys:
+        tag = "benefit" if polarity.get(k) == "benefit" else "cost"
+        md_lines.append(f"- {k.capitalize()} ({tag})")
+    md_lines.append("\n**Weights:**")
+    for k in all_keys:
+        md_lines.append(f"- {k.capitalize()}: {weights.get(k,0.0):.3f}")
+    md_lines.append("\n**Options:**")
+    for o, kv in options.items():
+        parts = [f"{k.capitalize()}={kv[k]}" for k in all_keys if k in kv]
+        md_lines.append(f"- {o}: " + ", ".join(parts))
+    md_lines.append("\n**Scores:**")
+    for o in sorted(S.keys()):
+        # selite: [k1:0.XXX, k2:0.XXX,...]
+        parts = [f"{k.capitalize()}:{S[o].get(k, 0.0):.3f}" for k in all_keys if k in S[o]]
+        md_lines.append(f"- {o}: U={U.get(o,0.0):.3f}  |  [{', '.join(parts)}]")
 
-    if not crits_found:
-        # jos ei mitään tunnistettuja kriteerejä → käytä oletuskolmikkoa
-        crits = DEFAULT_CRITERIA[:]
-        diag.append("No known criteria detected → using defaults: Impact/Cost/Risk.")
-        # jos puuttuu arvo, emme voi laskea; pidä fallback-options
+    md_lines.append("\n**Recommendation:**")
+    if rec:
+        md_lines.append(f"Choose {rec} (highest utility U).")
     else:
-        # järjestä: ensin oletusjärjestyksessä, sitten loput
-        crits = [c for c in DEFAULT_CRITERIA if c in crits_found] + \
-                [c for c in sorted(crits_found) if c not in DEFAULT_CRITERIA]
+        md_lines.append("Insufficient data.")
 
-    # 3) Täydennä puuttuvia arvoja (keskiarvo muiden perusteella tai heuristinen oletus)
-    #    pidetään yksinkertaisena: jos jostain optionista puuttuu kriteeri, täytetään mediaanilla.
-    for c in crits:
-        vals = [o[c] for o in options.values() if c in o]
-        if not vals:
-            # jos kaikilta puuttuu c, tiputetaan tämä kriteeri pois
-            for o in options.values():
-                if c in o:
-                    del o[c]
-            continue
-        med = sorted(vals)[len(vals)//2]
-        for o in options.values():
-            o.setdefault(c, med)
+    md_lines.append("\n**Uncertainty:**")
+    md_lines.append(note)
 
-    # varmista että jokaisella optionilla on samat kriteerit
-    for o in options.values():
-        for c in crits:
-            if c not in o:
-                # jos päädytään tänne, käytä 0.0, mutta lisää diagnostiikka
-                o[c] = 0.0
-                diag.append(f"Missing value imputed as 0.0 → {c}")
+    markdown = "\n".join(md_lines)
 
-    # 4) Weights
-    w = _parse_weights(text, crits) or {}
-    if not w:
-        # käytä defaultteja tunnetuille; jos uusia kriteerejä, jaa tasan
-        base = {c: DEFAULT_WEIGHTS.get(c, 1.0) for c in crits}
-        s = sum(base.values()) or 1.0
-        w = {c: base[c]/s for c in crits}
-        if "No structured options found in text" not in " ".join(diag):
-            diag.append("No weights parsed → normalized defaults used.")
-    else:
-        # normalisoi
-        s = sum(max(0.0, float(v)) for v in w.values()) or 1.0
-        w = {c: max(0.0, float(w.get(c, 0.0)))/s for c in crits}
-
-    # 5) Normalisoi ja laske hyötyfunktio
-    utilities = {name: 0.0 for name in options}
-    normalized: Dict[str, Dict[str, float]] = {c: {} for c in crits}
-
-    for c in crits:
-        vals = [float(options[o][c]) for o in options]
-        lo, hi = min(vals), max(vals)
-        reverse = (CRITERIA_KIND.get(c, "benefit").lower() == "cost")
-        for o in options:
-            s = _minmax(float(options[o][c]), lo, hi, reverse=reverse)
-            normalized[c][o] = s
-            utilities[o] += w[c] * s
-
-    ranked = sorted(utilities.items(), key=lambda t: t[1], reverse=True)
-    best = ranked[0][0]
-
-    # 6) Herkkyysanalyysi: +0.10 yksittäiseen painoon (renormalisointi)
-    sens_notes: List[str] = []
-    for c in crits:
-        tweaked = dict(w)
-        tweaked[c] = tweaked.get(c, 0.0) + 0.10
-        s2 = sum(tweaked.values()) or 1.0
-        tweaked = {k: v/s2 for k, v in tweaked.items()}
-        u2 = {o: 0.0 for o in options}
-        for cn in crits:
-            for o in options:
-                u2[o] += tweaked.get(cn,0.0) * normalized[cn][o]
-        new_best = max(u2, key=u2.get)
-        if new_best != best:
-            sens_notes.append(f"If weight({c}) +0.10 → winner flips: {best} → {new_best}.")
-    if not sens_notes:
-        sens_notes.append("Decision stable for small single-weight increases (+0.10).")
-
-    # 7) Raportointi
-    crit_lines = [f"- {c} ({CRITERIA_KIND.get(c,'benefit')})" for c in crits]
-    w_lines = [f"- {c}: {w[c]:.3f}" for c in crits]
-
-    # tulosta alkuperäiset (raaka) inputit selkeyden vuoksi
-    raw_opt_lines = []
-    for o in options:
-        vals = ", ".join(f"{c}={options[o][c]}" for c in crits)
-        raw_opt_lines.append(f"- {o}: {vals}")
-
-    score_lines = []
-    for o, U in ranked:
-        parts = [f"{c}:{normalized[c][o]:.3f}" for c in crits]
-        score_lines.append(f"- {o}: U={U:.3f}  |  [{', '.join(parts)}]")
-
-    # diagnoosi (valinnainen)
-    diag_lines = [f"- {d}" for d in diag] if diag else ["- Parsed successfully from natural language."]
-
-    md = [
-        "# StrategyMCDA",
-        "**Criteria:**",
-        *crit_lines,
-        "",
-        "**Weights:**",
-        *w_lines,
-        "",
-        "**Options (raw):**",
-        *raw_opt_lines,
-        "",
-        "**Scores (normalized min–max):**",
-        *score_lines,
-        "",
-        "**Recommendation:**",
-        f"Choose {best} (highest utility U).",
-        "",
-        "**Uncertainty / Sensitivity:**",
-        *sens_notes,
-        "",
-        "**Diagnostics:**",
-        *diag_lines,
-    ]
-
-    return {
-        "markdown": "\n".join(md),
-        "sections_present": ["Criteria","Weights","Options (raw)","Scores (normalized min–max)","Recommendation","Uncertainty / Sensitivity","Diagnostics"],
-        "sections_missing": [],
-    }
+    sections_present = ["Criteria", "Weights", "Options", "Scores", "Recommendation", "Uncertainty"]
+    sections_missing: List[str] = []
+    return {"markdown": markdown, "sections_present": sections_present, "sections_missing": sections_missing}
