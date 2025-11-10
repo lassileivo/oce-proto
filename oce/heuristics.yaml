@@ -1,26 +1,40 @@
+# OCE Heuristic Intelligence Stack v2.0
+# Author: Lassi Leivo
+
 intents:
-  strategy:
-    # Salli suomi + englanti + taivutukset
-    keywords: ["strategy", "strategia\\w*", "päätös\\w*", "vaihtoehto\\w*", "kriteeri\\w*", "priorisoin\\w*", "prioritiza\\w*"]
-    modules: ["StrategyMCDA", "RiskExpectedLoss", "Structure"]
-
-  risk:
-    keywords: ["risk\\w*", "riski\\w*", "uhka\\w*", "todennäköisyys\\w*", "vaikutus\\w*"]
-    modules: ["RiskExpectedLoss", "Structure"]
-
-  writing:
-    keywords: ["rakenna\\w*", "otsik\\w*", "runko\\w*", "argument\\w*"]
-    modules: ["Structure"]
+  strategic:
+    keywords: ["strategy", "decision", "priority", "goal", "objective", "career", "plan", "path", "choice", "overview"]
+    modules: ["Structure", "StrategyMCDA", "RiskExpectedLoss"]
+  scientific:
+    keywords: ["hypothesis", "falsify", "evidence", "experiment", "model", "data", "prediction", "test"]
+    modules: ["Structure", "CFL", "RiskExpectedLoss"]
+  ethical:
+    keywords: ["values", "responsibility", "moral", "dilemma", "justice", "duty", "harm"]
+    modules: ["Structure", "CFL"]
+  creative:
+    keywords: ["idea", "concept", "design", "art", "innovation", "compose", "sketch"]
+    modules: ["Structure", "Framing"]
+  reflective:
+    keywords: ["life", "career", "meaning", "purpose", "personal", "reflection", "introspection"]
+    modules: ["Structure", "StrategyMCDA"]
 
 policies:
   max_modules: 3
-  # Varmistus: jos mikään ei täsmää, ajetaan nämä kolme (niin näet modulit varmasti)
-  default_modules: ["Structure", "StrategyMCDA", "RiskExpectedLoss"]
+  default_modules: ["Structure"]
+  auto_detect_intent: true
+  include_meta_modules: ["CFL", "Metacog", "MythGuard"]
 
-meta:
-  min_sources_recency: 1
-  min_diverse_domains: 2
+priority_rules:
+  - name: "Tank first"
+    description: "Address the critical core problem before peripheral ones."
+    trigger_words: ["must", "critical", "main", "essential"]
+  - name: "Clarify before act"
+    description: "If intent is unclear, ask clarifying questions first."
+    trigger_words: ["unclear", "unsure", "help", "advice"]
 
-thresholds:
-  guided_threshold: 0.6
-  pro_threshold: 0.75
+meta_settings:
+  enable_self_reflection: true
+  enable_confidence_feedback: true
+  min_confidence: 0.4
+  max_confidence: 0.9
+  default_confidence: 0.6
