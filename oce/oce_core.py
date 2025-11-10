@@ -58,10 +58,12 @@ def _try_get_runner(modpath: str) -> Optional[Callable]:
     return None
 
 def _run_module_safely(modname: str, user_text: str, context: dict) -> Tuple[str, List[str], List[str]]:
+    # Steroidit: lisätty CFL-runner mapping
     mapping = {
         "Structure":        "oce.modules.structure",
         "StrategyMCDA":     "oce.modules.strategy_mcda",
         "RiskExpectedLoss": "oce.modules.risk_expected_loss",
+        "CFL":              "oce.modules.cfl",
     }
     runner = _try_get_runner(mapping.get(modname, "")) if modname in mapping else None
     if runner is None:
@@ -89,6 +91,7 @@ def _format_heuristic_path(rr: router.RouteResult) -> str:
 
 # -------- Lightweight extractors for memory --------
 _BULLET = re.compile(r"^\s*[-•]\s+(.*)$", re.MULTILINE)
+
 def _extract_actions(md: str) -> List[str]:
     # Hakee kohdan "**Actions:**" tai "**Next Step:**" jälkeiset bulletit
     chunks: List[str] = []
@@ -101,10 +104,12 @@ def _extract_actions(md: str) -> List[str]:
     return [c.strip() for c in chunks if c.strip()]
 
 def _extract_topics(md: str) -> List[str]:
-    # Poimii **Thesis:**-riviltä pääaiheen 1. lauseen
-    if "**Thesis:**" in md:
-        th = md.split("**Thesis:**", 1)[1].strip().split("\n", 1)[0]
-        return [th.strip()[:120]]
+    # Steroidit: poimi sekä Thesis että Hypothesis (scientific-frame)
+    for header in ("**Thesis:**", "**Hypothesis:**"):
+        if header in md:
+            th = md.split(header, 1)[1].strip().split("\n", 1)[0]
+            if th.strip():
+                return [th.strip()[:120]]
     return []
 
 # -------- Public API --------
@@ -138,13 +143,18 @@ def run_oce(user_text: str, session_ctx: dict) -> dict:
     log_heuristic(rr)
     selected = rr.selected_modules[:]
 
+    # Steroidit: varmista, että intent näkyy myös session_ctx:ssä
+    session_ctx["intent"] = rr.intent
+
     # 2) RUN MODULES
     module_blocks: List[str] = []
     sections_present: List[str] = []
     sections_missing: List[str] = []
 
+    # Steroidit: lähetä intent myös top-levelissä module_contextiin
     module_context: Dict[str, Any] = {
         "session_ctx": session_ctx,
+        "intent": rr.intent,  # <-- tärkeä Structure/CFL tuki
         "heuristics": {
             "intent": rr.intent,
             "confidence": rr.confidence,
