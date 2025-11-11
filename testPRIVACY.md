@@ -1,2 +1,0 @@
-This prototype (PROTO-OCE) sends the text you enter to a Render-hosted API to compute strategy/MCDA/risk outputs. No special categories of personal data should be entered. Data may be stored temporarily in server logs and a lightweight memory file keyed by oce-proto. Do not submit confidential information. This prototype is provided “as is”, without warranties. For removal requests or questions, contact: lassi.leivo@gmail.com
-.
